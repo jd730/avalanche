@@ -13,11 +13,13 @@
 Example: Training and evaluating on CLEAR benchmark (pre-trained features)
 """
 
+import argparse
 import json
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
 
 from avalanche.evaluation.metrics import (
     forgetting_metrics,
@@ -32,13 +34,31 @@ from avalanche.evaluation.metrics.accuracy import AccuracyPluginMetric
 from avalanche.logging import InteractiveLogger, TextLogger, TensorboardLogger
 from avalanche.training.plugins import EvaluationPlugin
 from avalanche.training.plugins.lr_scheduling import LRSchedulerPlugin
-from avalanche.training.supervised import Naive
+from avalanche.training.supervised import Naive, CWRStar, Replay, GDumb, Cumulative, LwF, GEM, AGEM, EWC,JointTraining,SynapticIntelligence,CoPE
 from avalanche.benchmarks.classic.clear import CLEAR, CLEARMetric
 
+from clear_utils import get_method
+
 # For CLEAR dataset setup
+#DATASET_NAME = "clear100_cvpr2022"
+#DATASET_NAME = "clear100"
 DATASET_NAME = "clear10_neurips2021"
-NUM_CLASSES = {"clear10_neurips_2021": 11, "clear100_cvpr2022": 100,
-               "clear10": 11, "clear100": 100}
+
+DATA_INFO = {
+        'clear10_neurips2021': {
+            'num_classes': 11,
+            'num_instance_each_class' : 300,
+            'num_instance_each_class_test' : 150
+            },
+        'clear10': {
+            'num_classes': 11,
+            'num_instance_each_class' : 300,
+            'num_instance_each_class_test' : 150
+            }
+        }
+
+
+
 CLEAR_FEATURE_TYPE = "moco_b0"  # MoCo V2 pretrained on bucket 0
 # CLEAR_FEATURE_TYPE = "moco_imagenet"  # MoCo V2 pretrained on imagenet
 # CLEAR_FEATURE_TYPE = "byol_imagenet"  # BYOL pretrained on imagenet
@@ -49,27 +69,42 @@ EVALUATION_PROTOCOL = "streaming"  # trainset = testset per timestamp
 # EVALUATION_PROTOCOL = "iid"  # 7:3 trainset_size:testset_size
 
 # For saving the datasets/models/results/log files
-ROOT = Path("..")
+ROOT = Path("CLEAR")
 DATA_ROOT = ROOT / DATASET_NAME
 MODEL_ROOT = ROOT / "models"
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 MODEL_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Define hyperparameters/model/scheduler/augmentation
-HPARAM = {
-    "batch_size": 512,
-    "num_epoch": 1,
-    "step_scheduler_decay": 60,
-    "scheduler_step": 0.1,
-    "start_lr": 1,
-    "weight_decay": 0,
-    "momentum": 0.9,
-}
+
+def get_args():
+    parser = argparse.ArgumentParser(description='PyTorch CLEARDataset Training')
+
+    parser.add_argument('-input_dim', type=int, default=2048)
+    parser.add_argument('-output_dim', type=int, default=512)
+    parser.add_argument('-method', type=str, default='Naive')
+    parser.add_argument('-dataset', type=str, default='clear10_neurips2021', choices=['clear10_neurips2021', 'clear100_cvpr2022', 'clear10', 'clear100'])
+    parser.add_argument('-batch_size', type=int, default=1024)
+    parser.add_argument('-num_epoch', type=int, default=1)
+    parser.add_argument('-timestamp', type=int, default=10)
+    parser.add_argument('-max_memory_size', type=int, default=3000000)
+
+    # LR
+    parser.add_argument('-start_lr', type=float, default=1)
+    parser.add_argument('-scheduler_step', type=float, default=0.1)
+    parser.add_argument('-step_scheduler_decay', type=int, default=60)
+    parser.add_argument('-weight_decay', type=float, default=0)
+    parser.add_argument('-momentum', type=float, default=0.9)
 
 
-def main():
+    args = parser.parse_args()
+    return args
+
+def main(args):
     # feature size is 2048 for resnet50
-    model = torch.nn.Linear(2048, NUM_CLASSES[DATASET_NAME])
+    num_classes = DATA_INFO[args.dataset]['num_classes']
+    model = torch.nn.Linear(args.input_dim, num_classes)
+    print(model)
 
     def make_scheduler(optimizer, step_size, gamma=0.1):
         scheduler = torch.optim.lr_scheduler.StepLR(
@@ -89,13 +124,15 @@ def main():
     eval_plugin = EvaluationPlugin(
         accuracy_metrics(minibatch=True, epoch=True, experience=True,
                          stream=True),
+#        accuracy_metrics(minibatch=True, epoch=True, experience=True,
+#                         stream=True, trained_experience=True), 
         loss_metrics(minibatch=True, epoch=True, experience=True,
                      stream=True),
         timing_metrics(epoch=True, epoch_running=True),
         forgetting_metrics(experience=True, stream=True),
         cpu_usage_metrics(experience=True),
         confusion_matrix_metrics(
-            num_classes=NUM_CLASSES[DATASET_NAME], save_image=False,
+            num_classes=num_classes, save_image=False,
             stream=True
         ),
         disk_usage_metrics(
@@ -110,7 +147,7 @@ def main():
         seed = 0
 
     benchmark = CLEAR(
-        data_name=DATASET_NAME,
+        data_name = DATASET_NAME,
         evaluation_protocol=EVALUATION_PROTOCOL,
         feature_type=CLEAR_FEATURE_TYPE,
         seed=seed,
@@ -122,29 +159,15 @@ def main():
 
     optimizer = torch.optim.SGD(
         model.parameters(),
-        lr=HPARAM["start_lr"],
-        weight_decay=HPARAM["weight_decay"],
-        momentum=HPARAM["momentum"],
+        lr=args.start_lr,
+        weight_decay=args.weight_decay,
+        momentum=args.momentum,
     )
     scheduler = make_scheduler(
-        optimizer,
-        HPARAM["step_scheduler_decay"],
-        HPARAM["scheduler_step"],
-    )
+        optimizer, args.step_scheduler_decay, args.scheduler_step)
 
     plugin_list = [LRSchedulerPlugin(scheduler)]
-    cl_strategy = Naive(
-        model,
-        optimizer,
-        torch.nn.CrossEntropyLoss(),
-        train_mb_size=HPARAM["batch_size"],
-        train_epochs=HPARAM["num_epoch"],
-        eval_mb_size=HPARAM["batch_size"],
-        evaluator=eval_plugin,
-        device=device,
-        plugins=plugin_list,
-    )
-
+    cl_strategy = get_method(model, optimizer, args, eval_plugin, plugin_list, DATA_INFO[args.dataset], device)
     # TRAINING LOOP
     print("Starting experiment...")
     results = []
@@ -168,8 +191,7 @@ def main():
     accuracy_matrix = np.zeros((num_timestamp, num_timestamp))
     for train_idx in range(num_timestamp):
         for test_idx in range(num_timestamp):
-            mname = f"Top1_Acc_Exp/eval_phase/test_stream" \
-                    f"/Task00{test_idx}/Exp00{test_idx}"
+            mname = f'Top1_Acc_Exp/eval_phase/test_stream/Task00{test_idx}/Exp00{test_idx}'
             accuracy_matrix[train_idx][test_idx] = results[train_idx][mname]
     print("Accuracy_matrix : ")
     print(accuracy_matrix)
@@ -188,4 +210,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    main(args)
